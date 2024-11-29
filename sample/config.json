@@ -1,0 +1,55 @@
+{
+  "service": {
+    "user": "_shiddns",
+    "group": "_shiddns",
+    "control": "control"
+  },
+  "network": {
+    "host": "127.0.0.1",
+    "port": 53,
+    "upstream_host": "1.1.1.1",
+    "upstream_port": 53
+  },
+  "storage": {
+    "filter": "/tmp",
+    "logs": "/tmp"
+  },
+  "localdns": {
+    "domain": "mein.zuhause",
+    "entries": [
+      {
+        "ip": "10.0.0.1",
+        "name": "fritzbox.mein.zuhause",
+        "filter": "services"
+      },
+      {
+        "ip": "10.0.0.100",
+        "name": "pc.mein.zuhause",
+        "filter": "kids"
+      }
+    ]
+  },
+  "filters": {
+    "default": {
+      "default_allow": "true",
+      "block_src": [
+        "hosts:https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+        "rx:file:///tmp/block_rx"
+      ],
+      "allow_src": null
+    },
+    "kids": {
+      "default_allow": "true",
+      "block_src": [
+        "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn-social/hosts",
+        "rx:file:///home/_shiddns/source/kids_block_rc"
+      ],
+      "allow_src": null
+    },
+    "services": {
+      "default_allow": "false",
+      "block_src": [],
+      "allow_src": ["rx:file:///home/_shiddns/source/services_allow_rx"]
+    }
+  }
+}

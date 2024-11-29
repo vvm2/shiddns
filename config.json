@@ -1,0 +1,54 @@
+{
+  "service": {
+    "user": "www",
+    "group": "www",
+    "control": "/tmp/control"
+  },
+  "network": {
+    "host": "127.0.0.1",
+    "port": 53535,
+    "upstream_host": "1.1.1.1",
+    "upstream_port": 53
+  },
+  "storage": {
+    "filter": "/tmp",
+    "logs": "/tmp"
+  },
+  "localdns": {
+    "domain": "mein.zuhause",
+    "entries": [
+      {
+        "ip": "10.0.0.1",
+        "name": "router.mein.zuhause",
+        "filter": "services"
+      },
+      {
+        "ip": "10.0.0.200",
+        "name": "pc-kids.mein.zuhause",
+        "filter": "kids"
+      }
+    ]
+  },
+  "filters": {
+    "default": {
+      "default_allow": "true",
+      "block_src": [
+        "hosts:https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+        "rx:file:///tmp/orig_blocks"
+      ],
+      "allow_src": []
+    },
+    "services": {
+      "default_allow": "false",
+      "block_src": [],
+      "allow_src": []
+    },
+    "kids": {
+      "default_allow": "true",
+      "block_src": [
+        "hosts:https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn-social/hosts"
+      ],
+      "allow_src": []
+    }
+  }
+}
