@@ -1050,6 +1050,8 @@ async def main():
         #thats just a fancy way to call this in an outside thread to
         #avoid blocking the resolution
         loop.run_in_executor(None, lambda: read_commands(dns))
+    
+    loop.stop()
 
 
 if __name__ == "__main__":
