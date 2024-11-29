@@ -93,9 +93,9 @@ would refer to:
 | /localdns/entries/ip | the ip of a local system to be resolved by this service |
 | /localdns/entries/name | the fqdn (must end in domain) of the system |
 | /localdns/entries/filter | name of the filter to apply for this host |
-| /filters/<filtername>/default_allow | true if queries should by default not be blocked, this is the starting point before evaluating all the block and allow lists |
-| /filters/<filtername>/block_src | remote locations of hosts like blocking files (hosts: prefix) or regular expression files (rx: prefix) |
-| /filters/<filtername>/allow_src | remote locations of hosts like allow files (hosts: prefix) or regular expression files (rx: prefix) |
+| /filters/&lt;filtername&gt;/default_allow | true if queries should by default not be blocked, this is the starting point before evaluating all the block and allow lists |
+| /filters/&lt;filtername&gt;/block_src | remote locations of hosts like blocking files (hosts: prefix) or regular expression files (rx: prefix) |
+| /filters/&lt;filtername&gt;/allow_src | remote locations of hosts like allow files (hosts: prefix) or regular expression files (rx: prefix) |
 
 *Note:* if you name a filter xyz, the following files may be created in the directory denoted in the
 `/storage/filter` configuration:
