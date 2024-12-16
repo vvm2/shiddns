@@ -1,15 +1,16 @@
 import asyncio
+import grp
 import json
 import logging
 import os
 import pwd
-import grp
 import re
 import urllib
 import urllib.request
 from asyncio.events import AbstractEventLoop
 from asyncio.transports import DatagramTransport
 from re import Pattern, error
+from threading import Lock
 from typing import Any
 
 from message import (
@@ -333,7 +334,8 @@ class DNSFilter:
 
         if self.storage_path is not None:
             f = open(self.__gen_local_storage_path(suffix), "w")  # overwrite!
-            f.writelines(rl)
+            f.write("\n".join(rl))
+            f.write("\n")
             f.close()
 
     def download_lists(self, src_list: list[str], suffix: str) -> None:
@@ -394,6 +396,8 @@ class DNSFilter:
             if len(tmp) > 0:
                 rx_list: list[Pattern] = []
                 for next in tmp:
+                    # use ^ and $ - we will strip leading and trainling whitespace
+                    next = next.strip()
                     try:
                         rx_list.append(re.compile(next))
                     except error:
@@ -481,8 +485,9 @@ class DNS:
         config_path (str): absolute path to the json filter config file
 
         """
-        self.running=True
+        self.running = True
         self.config_path = config_path
+        self.lock: Lock = Lock()
 
         # load config and do plausibility / format checking,
         # this will raise an InvalidFormatException if needed
@@ -495,6 +500,7 @@ class DNS:
 
         # local file to communicate with this service (mid-term replace with socket!)
         self.control_file: str = config["service"]["control"]
+        self.log_dir: str = config["storage"]["log"]
 
         # key = ip (str), value = (dnsname (str), filter_id (str))
         # used for reverse lookups of local network
@@ -691,10 +697,17 @@ class DNS:
             self.upstream_host,
             self.upstream_port,
         )
+        on_con_lost: asyncio.Future = loop.create_future()
         trans, proto = await asyncio.get_event_loop().create_datagram_endpoint(
-            lambda: UpstreamCallback(client_transport, client_address, data),
+            lambda: UpstreamCallback(
+                client_transport, client_address, data, on_con_lost
+            ),
             remote_addr=upstream_server,
         )
+        try:
+            await asyncio.wait_for(on_con_lost, timeout=10)
+        finally:
+            trans.close()
 
     def filter(self, dns_req_msg: Message, client_ip: str) -> bool:
         """Check if the dns message should be filtered out, this will work
@@ -741,18 +754,79 @@ class DNS:
 
         return not allow
 
-    def filter_update(self):
-        logging.info("downloading all filter sources")
-        for next in self.filters:
-            self.filters[next].update()
-        logging.info("download complete")
-        DNSFilter.content_cache.clear()
+    async def filter_update(self):
+        while not self.lock.acquire(blocking=False):
+            await asyncio.sleep(0.5)
 
-    def filter_reload(self):
-        logging.info("reloading all filters")
-        for next in self.filters:
-            self.filters[next].load()
-        logging.info("reloading done")
+        try:
+            logging.info("downloading all filter sources")
+            for next in self.filters:
+                self.filters[next].update()
+            logging.info("download complete")
+            DNSFilter.content_cache.clear()
+        finally:
+            self.lock.release()
+
+    def build_hosts_file(self, orig: str) -> str:
+        """build a new hosts file content by merging
+        the local dns configuration with the existing hosts file
+        content (orig). it works by replacing all entries ending
+        with the "local_domain".
+
+        Parameters
+        ----------
+        orig (str): the contents of the current hosts file
+
+        Returns
+        -------
+        (str): a new hosts file content
+        """
+        hosts: str = ""
+
+        lines: list[str] = orig.split("\n")
+        for next_line in lines:
+            tmp: str = next_line.strip()
+            # empty line?
+            if len(tmp) == 0:
+                hosts += "\n"
+            # comment line?
+            elif tmp.startswith("#"):
+                hosts += next_line + "\n"
+            # everything else----
+            else:
+                entry: list[str] = next_line.split()  # split by whitespace
+                k: int = 1  # skip the inet address
+
+                # build the next line starting with the inet addr
+                newline: list[str] = []
+                newline.append(entry[0])
+
+                while k < len(entry):
+                    # filter out all lines that contain a localdomani
+                    if not entry[k].endswith(self.local_domain):
+                        newline.append(entry[k])
+                    k += 1
+
+                if len(newline) > 1:
+                    hosts += f"{' '.join(newline)}\n"
+
+        for next in self.known_names:
+            ip, filter = self.known_names[next]
+            hosts += f"{ip} {next}\n"
+
+        return hosts
+
+    async def filter_reload(self):
+        while not self.lock.acquire(blocking=False):
+            await asyncio.sleep(0.5)
+
+        try:
+            logging.info("reloading all filters")
+            for next in self.filters:
+                self.filters[next].load()
+            logging.info("reloading done")
+        finally:
+            self.lock.release()
 
     def local_fw_lookup(self, domain: str) -> tuple[str, str] | None:
         """lookup a local domain name and retrieve the ip and filter name
@@ -891,7 +965,16 @@ class ServerCallback(asyncio.DatagramProtocol):
         pass
 
     def datagram_received(self, data: bytes, addr: tuple[str | Any, int]) -> None:
-        logging.info(f"con: ip={addr[0]}, port={addr[1]}")
+        logging.debug(f"con: ip={addr[0]}, port={addr[1]}")
+
+        # resolve the requester (if possible)
+        tmp: tuple[str, str] | None = self.dns.local_rv_lookup(addr[0])
+        client_name: str = addr[0]
+        filter_name: str = "default"
+
+        if tmp is not None:
+            client_name = tmp[0]
+            filter_name = tmp[1]
 
         # FLOW:
         #  1. RECEIVE REQUEST
@@ -909,13 +992,16 @@ class ServerCallback(asyncio.DatagramProtocol):
         # if sanity check fails, or the message should be filtered,
         # them orig request header will be modified, we can send that back
         sane: bool = self.dns.sanity_check(dns_req_msg)
-
-        if sane:
-            logging.debug(f"query: {dns_req_msg.question[0].qname}")
+        if not sane:
+            logging.info(
+                f"[{client_name}][{filter_name}][invalid query] {dns_req_msg.question[0].qname}"
+            )
 
         filter: bool = True if not sane else self.dns.filter(dns_req_msg, addr[0])
         if filter:
-            logging.debug(f"block: {dns_req_msg.question[0].qname}")
+            logging.info(
+                f"[{client_name}][{filter_name}][block] {dns_req_msg.question[0].qname}"
+            )
 
         if not sane or filter:
             # sice the req was just parsed, this should never be None!
@@ -923,6 +1009,9 @@ class ServerCallback(asyncio.DatagramProtocol):
                 dns_req_msg.build_from_orig_with_header(), addr
             )
         else:
+            logging.info(
+                f"[{client_name}][{filter_name}][query] {dns_req_msg.question[0].qname}"
+            )
             dns_resp_bytes: bytes | None = self.dns.resolve(
                 data, dns_req_msg, self.client_transport, addr
             )
@@ -944,6 +1033,7 @@ class UpstreamCallback(asyncio.DatagramProtocol):
         requester_transport: DatagramTransport,
         requester_addr: tuple[str | Any, int],
         orig_request: bytes,
+        on_con_lost: asyncio.Future,
     ) -> None:
         """constructor for the upstream connection callback. these callbacks are fired
         for the upstream server connection
@@ -962,6 +1052,7 @@ class UpstreamCallback(asyncio.DatagramProtocol):
         self.orig_request = orig_request
         self.requester_transport = requester_transport
         self.requester_address = requester_addr
+        self.on_connection_lost = on_con_lost
 
     def connection_made(self, transport: DatagramTransport) -> None:
         """this event is called when the UDP socket for connecting
@@ -972,7 +1063,7 @@ class UpstreamCallback(asyncio.DatagramProtocol):
         self.upstream_transport.sendto(self.orig_request)
 
     def connection_lost(self, exc: Exception | None) -> None:
-        pass
+        self.on_connection_lost.set_result(True)
 
     def datagram_received(self, data: bytes, addr: tuple[str | Any, int]) -> None:
         """this event is called when the upstream dns sends a response back,
@@ -989,9 +1080,22 @@ class UpstreamCallback(asyncio.DatagramProtocol):
 
 def init_logging():
     """initialize the logger"""
-    fmtstr: str = "[%(asctime)s][%(levelname)8s] %(message)s"
+    fmtstr: str = "[%(asctime)s][%(levelname)s] %(message)s"
     datefmt: str = "%Y-%m-%d %H:%M:%S %Z"
-    logging.basicConfig(level=logging.DEBUG, format=fmtstr, datefmt=datefmt)
+    logging.basicConfig(level=logging.INFO, format=fmtstr, datefmt=datefmt)
+
+
+def update_hosts(dns: DNS):
+    hosts_path: str = "/etc/hosts"
+    logging.info(f"updating hosts file: {hosts_path}")
+    f = open(hosts_path, "r")
+    orig: str = f.read()
+    f.close()
+
+    new_hosts: str = dns.build_hosts_file(orig)
+    f = open(hosts_path, "w")
+    f.write(new_hosts)
+    f.close()
 
 
 def read_commands(dns: DNS):
@@ -1006,13 +1110,26 @@ def read_commands(dns: DNS):
         f.close()
         if len(cmd) > 0:
             cmd = cmd.strip()
-            logging.debug(f"received command: {cmd}")
+            logging.info(f"received command: {cmd}")
             if cmd == "update":
-                dns.filter_update()
+                asyncio.run(dns.filter_update())
             elif cmd == "reload":
-                dns.filter_reload()
+                asyncio.run(dns.filter_reload())
             elif cmd == "stop":
                 dns.running = False
+            elif cmd == "fstat":
+                for name in dns.filters:
+                    next: DNSFilter = dns.filters[name]
+                    logging.info(f"{name} --> rx")
+                    if dns.filters[name].block_rx is not None:
+                        for p in dns.filters[name].block_rx:
+                            logging.info(p)
+            else:
+                logging.info(f"unknown command: {cmd}")
+    else:
+        # if the control file does not exist - touch()
+        f = open(dns.control_file, "w")
+        f.close()
 
 
 async def main():
@@ -1024,7 +1141,7 @@ async def main():
     logging.info("loading configuration")
 
     # load and parse config, initialize dns+filters
-    logging.debug(f"file: {config}")
+    logging.info(f"file: {config}")
     dns: DNS = DNS(config)
 
     # for privileged ports, this service needs to be started as root!
@@ -1038,6 +1155,8 @@ async def main():
 
     # if started as root, make sure to drop privileges!
     if os.getuid() == 0:
+        update_hosts(dns)
+
         svc_uid = pwd.getpwnam(dns.daemon_user).pw_uid
         svc_gid = grp.getgrnam(dns.daemon_group).gr_gid
         os.setgroups([])
@@ -1046,11 +1165,12 @@ async def main():
         os.umask(0o077)
 
     while dns.running:
-        await asyncio.sleep(10)
-        #thats just a fancy way to call this in an outside thread to
-        #avoid blocking the resolution
+        await asyncio.sleep(1)
+        # thats just a fancy way to call this in an outside thread to
+        # avoid blocking the resolution
         loop.run_in_executor(None, lambda: read_commands(dns))
-    
+
+    logging.info("stopping dns service")
     loop.stop()
 
 
